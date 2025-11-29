@@ -1,31 +1,65 @@
 ﻿# python
 # 文件: main_gui.py （第 1 部分：ManosabaTextBox）
+import io
 import random
 import time
-import psutil
-from pynput.keyboard import Key, Controller, GlobalHotKeys
-import pyperclip
-import io
-from PIL import Image
-import pyclip
+# 可选依赖改为容错导入
+try:
+    import psutil
+except Exception:
+    psutil = None
+try:
+    from pynput.keyboard import Key, Controller, GlobalHotKeys
+except Exception:
+    # 提供最小 stub，避免未安装时导致导入失败
+    class Key:
+        ctrl = "ctrl"
+        cmd = "cmd"
+        enter = "enter"
+    class Controller:
+        def press(self, *a, **k): pass
+        def release(self, *a, **k): pass
+    GlobalHotKeys = None
+
+# pyperclip / pyclip 容错
+try:
+    import pyperclip
+except Exception:
+    pyperclip = None
+try:
+    import pyclip
+except Exception:
+    pyclip = None
+
 from sys import platform
 import os
 import yaml
 import tempfile
 import subprocess
 import threading
+import datetime
+import glob
 
 PLATFORM = platform.lower()
 
+# Windows 特有库容错导入（不再 raise）
 if PLATFORM.startswith('win'):
     try:
         import win32clipboard
+    except Exception:
+        win32clipboard = None
+    try:
         import keyboard
+    except Exception:
+        keyboard = None
+    try:
         import win32gui
+    except Exception:
+        win32gui = None
+    try:
         import win32process
-    except ImportError:
-        print("请先安装 Windows 运行库: pip install pywin32 keyboard")
-        raise
+    except Exception:
+        win32process = None
 
 
 class ManosabaTextBox:
@@ -209,6 +243,9 @@ class ManosabaTextBox:
                 if result.returncode != 0:
                     print(f"复制图片到剪贴板失败: {result.stderr.decode()}")
             elif PLATFORM.startswith('win'):
+                if win32clipboard is None:
+                    print("Warning: win32clipboard 未安装，无法复制图片到剪贴板")
+                    return
                 # 打开 PNG 字节为 Image
                 image = Image.open(io.BytesIO(png_bytes))
                 # 转换成 BMP 字节流（去掉 BMP 文件头的前 14 个字节）
@@ -216,10 +253,15 @@ class ManosabaTextBox:
                     image.convert("RGB").save(output, "BMP")
                     bmp_data = output.getvalue()[14:]
                 # 打开剪贴板并写入 DIB 格式
-                win32clipboard.OpenClipboard()
-                win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardData(win32clipboard.CF_DIB, bmp_data)
-                win32clipboard.CloseClipboard()
+                try:
+                    win32clipboard.OpenClipboard()
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardData(win32clipboard.CF_DIB, bmp_data)
+                finally:
+                    try:
+                        win32clipboard.CloseClipboard()
+                    except Exception:
+                        pass
             else:
                 # todo: Linux 支持
                 pass
@@ -432,18 +474,53 @@ class ManosabaGUI:
         self.textbox = ManosabaTextBox()
         self.active = True
         self.hotkey_registered = False
+        # 记录暂停时的角色 id，用于恢复后自动加载
+        self.paused_char: str | None = None
 
         # UI 元素
         self.char_var = tk.StringVar()
         self.emotion_var = tk.IntVar(value=1)
         self.auto_paste_var = tk.BooleanVar(value=self.textbox.AUTO_PASTE_IMAGE)
         self.auto_send_var = tk.BooleanVar(value=self.textbox.AUTO_SEND_IMAGE)
-        self.status_var = tk.StringVar(value="就绪")
+        # 状态消息（进度旁显示的文本）
+        self.status_msg_var = tk.StringVar(value="就绪")
+        # 状态名字与颜色（单独显示的小条）
+        self.status_state = 'ready'
+
         self.progress_var = tk.DoubleVar(value=0)
 
+        # 日志相关
+        self._log_lock = threading.Lock()
+        self.log_dir = os.path.join(self.textbox.BASE_PATH, "log")
+        os.makedirs(self.log_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.current_log_file = os.path.join(self.log_dir, f"startup_{ts}.log")
+        # 轮换仅保留最近两次 startup_ 开头的日志
+        try:
+            existing = sorted(glob.glob(os.path.join(self.log_dir, "startup_*.log")))
+            # append current immediately (file may not exist yet)
+            existing.append(self.current_log_file)
+            # keep only last 2
+            to_keep = existing[-2:]
+            for f in glob.glob(os.path.join(self.log_dir, "startup_*.log")):
+                if f not in to_keep:
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 记录启动信息
+        self._log("应用启动: " + datetime.datetime.now().isoformat())
+
+        # 构建 UI
         self._build_ui()
         self._populate_characters()
         self._bind_events()
+
+        # 将主窗口居中（使以 root 为 parent 的弹窗也以屏幕居中）
+        self.center_window(self.root)
 
         # 预加载当前角色
         char_name = self.textbox.get_character(self.char_var.get() or None)
@@ -549,12 +626,14 @@ class ManosabaGUI:
         btn_frame.pack(fill='x', pady=6)
         self.btn_generate = ttk.Button(btn_frame, text="生成图片", command=self.action_generate)
         self.btn_generate.pack(side='left', padx=6)
-        self.btn_delete_cache = ttk.Button(btn_frame, text="清除缓存", command=self.action_delete_cache)
-        self.btn_delete_cache.pack(side='left', padx=6)
+        # 已移除：主界面清除缓存按钮（迁移至设置）
+        # self.btn_delete_cache = ttk.Button(btn_frame, text="清除缓存", command=self.action_delete_cache)
+        # self.btn_delete_cache.pack(side='left', padx=6)
         self.btn_pause = ttk.Button(btn_frame, text="暂停/恢复", command=self.action_pause)
         self.btn_pause.pack(side='left', padx=6)
-        self.btn_quit = ttk.Button(btn_frame, text="退出", command=self.action_quit)
-        self.btn_quit.pack(side='right', padx=6)
+        # 已移除：退出按钮
+        # self.btn_quit = ttk.Button(btn_frame, text="退出", command=self.action_quit)
+        # self.btn_quit.pack(side='right', padx=6)
         self.btn_settings = ttk.Button(btn_frame, text="设置", command=self.open_settings)
         self.btn_settings.pack(side='left', padx=6)
 
@@ -562,9 +641,18 @@ class ManosabaGUI:
         status_frame = ttk.Frame(frm)
         status_frame.pack(fill='x', pady=4)
         self.progress = ttk.Progressbar(status_frame, variable=self.progress_var, maximum=100)
-        self.progress.pack(fill='x', padx=4, pady=2)
-        self.status_label = ttk.Label(status_frame, textvariable=self.status_var)
-        self.status_label.pack(anchor='w', padx=4)
+        self.progress.pack(fill='x', padx=4, pady=2, side='left', expand=True)
+
+        # 进度旁的提示信息（文本）
+        self.status_msg_label = tk.Label(status_frame, textvariable=self.status_msg_var, anchor='w')
+        self.status_msg_label.pack(side='left', padx=(6,4))
+
+        # 状态显示（短条，带颜色与状态文字）
+        self.state_label = tk.Label(status_frame, text="就绪", bd=1, relief='sunken', padx=6, pady=2)
+        self.state_label.pack(side='right', padx=4)
+
+        # 初始化状态颜色/文字
+        self._apply_status_color('ready')
 
     def _populate_characters(self):
         chars = self.textbox.character_list
@@ -648,13 +736,16 @@ class ManosabaGUI:
             self._call_in_main_thread(self._set_progress, pct)
 
         def worker():
+            # 在开始时明确进入“生成中/加载中”状态（确保颜色为黄）
             self._call_in_main_thread(self._set_ui_state, False)
-            self._call_in_main_thread(self.update_status, f"正在加载角色 {self.textbox.get_character(char_name, full_name=True)} ...")
+            self._call_in_main_thread(self.update_status, f"正在加载角色 {self.textbox.get_character(char_name, full_name=True)} ...", 'running')
             try:
                 self.textbox.generate_and_save_images(char_name, update_progress)
-                self._call_in_main_thread(self.update_status, f"角色 {self.textbox.get_character(char_name, full_name=True)} 加载完成 ✓")
+                # 加载完成后明确恢复为就绪（绿色）
+                self._call_in_main_thread(self.update_status, f"角色 {self.textbox.get_character(char_name, full_name=True)} 加载完成 ✓", 'ready')
             except Exception as e:
-                self._call_in_main_thread(self.update_status, f"加载失败: {e}")
+                # 失败也切回就绪，显示错误信息
+                self._call_in_main_thread(self.update_status, f"加载失败: {e}", 'ready')
             finally:
                 self._call_in_main_thread(self._set_ui_state, True)
                 self._call_in_main_thread(self._set_progress, 0)
@@ -666,59 +757,326 @@ class ManosabaGUI:
         self.char_combo.config(state=state)
         self.emotion_combo.config(state=state)
         self.btn_generate.config(state=state)
-        self.btn_delete_cache.config(state=state)
-        self.btn_pause.config(state=state)
+        # 注意：不要禁用暂停按钮，否则无法恢复
+        # self.btn_pause.config(state=state)  # 已移除
 
-    def _set_progress(self, pct: int):
-        self.progress_var.set(pct)
+    def _set_progress(self, val: float):
+        """主线程调用：设置进度（0-100），容错并限制范围。"""
+        try:
+            v = float(val or 0)
+        except Exception:
+            v = 0.0
+        if v < 0:
+            v = 0.0
+        if v > 100:
+            v = 100.0
+        try:
+            self.progress_var.set(v)
+            # 立即刷新 UI（在主线程）
+            try:
+                self.progress.update_idletasks()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
-    def update_status(self, msg: str):
-        self.status_var.set(str(msg))
+    # 新：内部方法，根据状态设置颜色和状态短条文本
+    def _apply_status_color(self, state: str):
+        # 三种颜色：就绪(绿), 生成中(黄), 已暂停(红)
+        mapping = {
+            'ready': ('就绪', '#2ecc71'),      # 绿
+            'running': ('生成中', '#f1c40f'),  # 黄
+            'paused': ('已暂停', '#e74c3c'),   # 红
+        }
+        text, color = mapping.get(state, ('就绪', '#2ecc71'))
+        self.status_state = state
+        # 设置短条文本与颜色（state_label）
+        try:
+            self.state_label.config(text=text, bg=color, fg='black')
+        except Exception:
+            pass
+        # 如果没有额外消息时，保持进度旁消息与状态短条一致
+        try:
+            if not self.status_msg_var.get() or self.status_msg_var.get() in ('就绪', '生成中...', '应用已暂停。', '应用已激活。'):
+                self.status_msg_var.set(text)
+        except Exception:
+            pass
+
+    def update_status(self, msg: str = None, state: str | None = None):
+        if state:
+            # 先更新颜色/短条
+            self._apply_status_color(state)
+        if msg is not None:
+            # 将提示文本显示在进度旁
+            try:
+                self.status_msg_var.set(str(msg))
+            except Exception:
+                pass
+            # 记录日志
+            try:
+                self._log(str(msg))
+            except Exception:
+                pass
+
+    # 新：打开日志查看器（显示最近两次启动日志内容）
+    def open_log_viewer(self, owner: tk.Toplevel | tk.Tk | None = None):
+        try:
+            from tkinter.scrolledtext import ScrolledText
+        except Exception:
+            ScrolledText = None
+
+        parent_win = owner if owner is not None else self.root
+        win = tk.Toplevel(parent_win)
+        win.title("查看日志")
+        win.transient(parent_win)
+        win.resizable(True, True)
+
+        # 日志等级选择（All / info / warning / error）
+        top_frame = ttk.Frame(win, padding=6)
+        top_frame.pack(fill='x')
+        ttk.Label(top_frame, text="日志等级:").pack(side='left')
+        lvl_var = tk.StringVar(value="all")
+        lvl_menu = ttk.Combobox(top_frame, textvariable=lvl_var, values=["all", "info", "warning", "error"], state='readonly', width=8)
+        lvl_menu.pack(side='left', padx=(6,8))
+
+        btn_refresh = ttk.Button(top_frame, text="刷新", width=8, command=lambda: _load_logs())
+        btn_refresh.pack(side='left', padx=4)
+        btn_close = ttk.Button(top_frame, text="关闭", width=8, command=win.destroy)
+        btn_close.pack(side='right', padx=4)
+
+        if ScrolledText is None:
+            lbl = tk.Label(win, text="无法加载 ScrolledText，查看日志文件目录：" + self.log_dir)
+            lbl.pack(fill='both', expand=True, padx=8, pady=8)
+        else:
+            st = ScrolledText(win, wrap='none', width=100, height=30)
+            st.pack(fill='both', expand=True, padx=6, pady=(0,6))
+            st.configure(state='disabled')
+
+            def _load_logs():
+                try:
+                    st.configure(state='normal')
+                    st.delete('1.0', 'end')
+                    files = sorted(glob.glob(os.path.join(self.log_dir, "startup_*.log")))
+                    last_two = files[-2:] if files else []
+                    level_filter = lvl_var.get().lower()
+                    for f in last_two:
+                        st.insert('end', f"===== {os.path.basename(f)} =====\n")
+                        try:
+                            with open(f, 'r', encoding='utf-8') as fp:
+                                for line in fp:
+                                    if level_filter == "all":
+                                        st.insert('end', line)
+                                    else:
+                                        # 只显示包含对应 [level] 的行
+                                        if f"[{level_filter}]" in line.lower():
+                                            st.insert('end', line)
+                        except Exception:
+                            st.insert('end', f"(无法读取 {f})\n")
+                    st.see('end')
+                except Exception as e:
+                    try:
+                        st.insert('end', f"读取日志失败: {e}")
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        st.configure(state='disabled')
+                    except Exception:
+                        pass
+
+            _load_logs()
+
+        # 居中并设置 grab，这样即使 settings 有 grab 也能在日志窗口操作并关闭
+        try:
+            self.center_window(win)
+            win.grab_set()
+        except Exception:
+            pass
 
     def action_generate(self):
         """在后台线程中调用 textbox.start 并更新状态"""
         if not self.active:
-            self.update_status("已暂停，忽略生成请求")
+            self.update_status("已暂停，忽略生成请求", state='paused')
             return
 
         def worker():
             self._call_in_main_thread(self._set_ui_state, False)
-            self.update_status("正在生成图片...")
+            # 标记生成中状态
+            self._call_in_main_thread(self.update_status, "生成中...", 'running')
             try:
                 result = self.textbox.start()
-                self._call_in_main_thread(self.update_status, result)
+                self._call_in_main_thread(self.update_status, result, 'ready')
             except Exception as e:
-                self._call_in_main_thread(self.update_status, f"生成失败: {e}")
+                self._call_in_main_thread(self.update_status, f"生成失败: {e}", 'ready')
             finally:
                 self._call_in_main_thread(self._set_ui_state, True)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def action_delete_cache(self):
-        self.update_status("正在清除缓存...")
+        # 该方法仍保留以防外部调用（但 UI 中已移除按钮）
+        self.update_status("正在清除缓存...", 'running')
         try:
             self.textbox.delete(self.textbox.CACHE_PATH)
-            self.update_status("缓存已清除，需要重新加载角色")
+            self.update_status("缓存已清除，需要重新加载角色", 'ready')
         except Exception as e:
-            self.update_status(f"清除缓存失败: {e}")
+            self.update_status(f"清除缓存失败: {e}", 'ready')
 
     def action_pause(self):
         self.active = not self.active
-        status = "激活" if self.active else "暂停"
-        self.update_status(f"应用已{status}。")
-        self._set_ui_state(self.active)
+        if not self.active:
+            # 切换到暂停：记录当前选中角色，设置状态为 paused
+            try:
+                self.paused_char = self.char_var.get() or None
+            except Exception:
+                self.paused_char = None
+            self.update_status("应用已暂停。", 'paused')
+            self._set_ui_state(False)
+        else:
+            # 恢复：先启用 UI，再自动加载暂停前的角色（如果有）
+            self._set_ui_state(True)
+            self.update_status("应用已恢复，正在恢复角色...", 'running')
+            if self.paused_char:
+                try:
+                    # 异步加载已暂停的角色（load_character_images 会在后台线程执行）
+                    self.load_character_images(self.paused_char)
+                except Exception:
+                    pass
+                finally:
+                    self.paused_char = None
+            else:
+                self.update_status("应用已激活。", 'ready')
 
     def action_quit(self):
         # 取消全局热键（如果注册）
         try:
             if self.hotkey_registered and PLATFORM.startswith('win'):
                 import keyboard
-                keyboard.clear_all_hotkeys()
+                try:
+                    keyboard.clear_all_hotkeys()
+                except Exception:
+                    pass
         except Exception:
             pass
-        self.root.destroy()
+        # 写日志并销毁主窗口
+        try:
+            self._log("应用退出: " + datetime.datetime.now().isoformat())
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            try:
+                self.root.quit()
+            except Exception:
+                pass
 
+    def center_window(self, win: tk.Tk | tk.Toplevel):
+        """将给定窗口移动到屏幕中央（仅设置位置，不改变窗口大小以避免尺寸错误）"""
+        try:
+            win.update_idletasks()
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            # 优先使用当前已布局的真实像素尺寸，fallback 到请求尺寸
+            w = win.winfo_width() or win.winfo_reqwidth() or 1
+            h = win.winfo_height() or win.winfo_reqheight() or 1
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 2)
+            # 仅设置位置，避免改变窗口大小
+            win.geometry(f"+{x}+{y}")
+        except Exception:
+            try:
+                sw = win.winfo_screenwidth()
+                sh = win.winfo_screenheight()
+                x = sw // 2
+                y = sh // 2
+                win.geometry(f"+{x}+{y}")
+            except Exception:
+                pass
+
+    # 新增：线程安全写日志，支持等级并格式化输出（兼容原调用）
+    def _log(self, msg: str, level: str = "info"):
+        """
+        写入日志，格式：YYYY-MM-DD HH:MM:SS [level] : 信息
+        level: info|warning|error（不区分大小写）
+        容错且线程安全，不抛异常。
+        """
+        try:
+            if msg is None:
+                return
+            lvl = (level or "info").lower()
+            if lvl not in ("info", "warning", "error"):
+                lvl = "info"
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            line = f"{timestamp} [{lvl}] : {msg}\n"
+
+            lock = getattr(self, "_log_lock", None)
+            logfile = getattr(self, "current_log_file", None)
+            if lock is None or logfile is None:
+                # 无法写入文件则降级到打印，避免抛异常阻塞主流程
+                try:
+                    print(line, end='')
+                except Exception:
+                    pass
+                return
+
+            # 使用锁确保多线程写入安全
+            try:
+                with lock:
+                    try:
+                        with open(logfile, 'a', encoding='utf-8') as fp:
+                            fp.write(line)
+                    except Exception:
+                        # 尝试备用打开模式
+                        try:
+                            with open(logfile, 'a') as fp:
+                                fp.write(line)
+                        except Exception:
+                            # 最后兜底打印
+                            try:
+                                print(line, end='')
+                            except Exception:
+                                pass
+            except Exception:
+                # 锁或写入过程中出错也要吞掉异常
+                try:
+                    print(line, end='')
+                except Exception:
+                    pass
+        except Exception:
+            # 保证不会因为日志写入而抛出异常
+            pass
+
+
+# 在文件末尾补充程序入口，保证可运行及优雅退出
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ManosabaGUI(root)
-    root.mainloop()
+    try:
+        root = tk.Tk()
+        app = ManosabaGUI(root)
+        try:
+            root.mainloop()
+        except KeyboardInterrupt:
+            try:
+                app._log("KeyboardInterrupt 捕获，准备退出。")
+            except Exception:
+                pass
+            try:
+                app.action_quit()
+            except Exception:
+                pass
+    except Exception as e:
+        # 如果在创建 GUI 时抛异常，打印日志并尝试优雅退出
+        try:
+            print(f"应用启动失败: {e}")
+        except Exception:
+            pass
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        try:
+            sys.exit(0)
+        except Exception:
+            pass
+

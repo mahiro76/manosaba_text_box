@@ -197,8 +197,9 @@ class ManosabaTextBox:
 
         total_images = 16 * emotion_cnt
 
-        # 尝试获取角色专属背景文件列表（assets/chara/<character>/background/*）
-        char_bg_dir = os.path.join(self.BASE_PATH, 'assets', 'chara', character_name, 'background')
+        # 尝试获取角色专属背景文件列表（改为 assets/background/chara/<character>/*）
+        # 旧路径： os.path.join(self.BASE_PATH, 'assets', 'chara', character_name, 'background')
+        char_bg_dir = os.path.join(self.BASE_PATH, 'assets', 'background', 'chara', character_name)
         char_bg_files = []
         if os.path.isdir(char_bg_dir):
             for ext in ('*.png', '*.jpg', '*.jpeg', '*.bmp'):
@@ -208,12 +209,13 @@ class ManosabaTextBox:
 
         for j in range(emotion_cnt):
             for i in range(16):
-                # 优先使用角色目录内背景（按序或循环），否则回退到全局 background/cN.png
+                # 优先使用角色目录内背景（按序或循环），否则回退到全局 background/public/cN.png
                 img_idx = j * 16 + i
                 if char_bg_files:
                     bg_path = char_bg_files[img_idx % len(char_bg_files)]
                 else:
-                    global_bg_path = os.path.join(self.BASE_PATH, 'assets', "background", f"c{i + 1}.png")
+                    # 改为使用 assets/background/public 作为默认背景目录
+                    global_bg_path = os.path.join(self.BASE_PATH, 'assets', "background", "public", f"c{i + 1}.png")
                     bg_path = global_bg_path if os.path.isfile(global_bg_path) else None
 
                 overlay_path = os.path.join(
@@ -528,6 +530,9 @@ class ManosabaGUI:
         self.textbox = ManosabaTextBox()
         self.active = True
         self.hotkey_registered = False
+        # 支持多个热键句柄（key -> handle）
+        self._hotkey_handles = {}
+
         # 记录暂停时的角色 id，用于恢复后自动加载
         self.paused_char: str | None = None
 
@@ -603,41 +608,45 @@ class ManosabaGUI:
             return
         SettingsDialog(self)
 
-    def _register_global_hotkey(self, key: str):
-        """注册全局热键（返回 handle 并保存到 self._hotkey_handle）"""
+    def _register_global_hotkey(self, key: str, callback=None):
+        """注册全局热键并返回 handle；callback 可选，默认触发生成"""
         if not PLATFORM.startswith('win'):
             self.update_status("仅 Windows 支持全局热键注册。")
-            return
+            return None
         try:
             import keyboard
         except Exception as e:
             self.update_status(f"无法导入 keyboard 库: {e}")
-            return
+            return None
 
-        # 先移除已有句柄
+        # 先移除已有相同 key 的句柄
         try:
-            if getattr(self, '_hotkey_handle', None) is not None:
-                keyboard.remove_hotkey(self._hotkey_handle)
-                self._hotkey_handle = None
+            existing = self._hotkey_handles.get(key)
+            if existing is not None:
+                try:
+                    keyboard.remove_hotkey(existing)
+                except Exception:
+                    pass
+                del self._hotkey_handles[key]
         except Exception:
             pass
 
         try:
-            handle = keyboard.add_hotkey(key, lambda: self._call_in_main_thread(self.action_generate))
-            self._hotkey_handle = handle
+            if callback is None:
+                cb = lambda: self._call_in_main_thread(self.action_generate)
+            else:
+                # wrap callback to ensure executed in main thread
+                cb = lambda: self._call_in_main_thread(callback)
+
+            handle = keyboard.add_hotkey(key, cb)
+            # 记录句柄
+            self._hotkey_handles[key] = handle
             self.hotkey_registered = True
-            self.textbox.keymap['start_generate'] = key
-            # 同步写回配置文件
-            try:
-                with open(os.path.join(self.textbox.CONFIG_PATH, "keymap.yml"), 'w', encoding='utf-8') as fp:
-                    yaml.safe_dump({PLATFORM: self.textbox.keymap}, fp, allow_unicode=True)
-            except Exception:
-                pass
             self.update_status(f"已注册全局快捷键: {key}")
+            return handle
         except Exception as e:
-            self.hotkey_registered = False
-            self._hotkey_handle = None
             self.update_status(f"注册快捷键失败: {e}")
+            return None
 
     def _unregister_global_hotkey(self):
         """移除已注册的全局热键（如果存在）"""
@@ -648,18 +657,77 @@ class ManosabaGUI:
         except Exception:
             return
         try:
-            if getattr(self, '_hotkey_handle', None) is not None:
+            for key, handle in list(self._hotkey_handles.items()):
                 try:
-                    keyboard.remove_hotkey(self._hotkey_handle)
+                    if handle is not None:
+                        keyboard.remove_hotkey(handle)
                 except Exception:
-                    # 退回到清除所有热键的兜底方式
+                    pass
+                try:
+                    del self._hotkey_handles[key]
+                except Exception:
+                    pass
+            self._hotkey_handles.clear()
+            self.hotkey_registered = False
+            self.update_status("已取消全局快捷键。")
+        except Exception:
+            pass
+
+    def _setup_global_hotkey(self):
+        """根据 textbox.keymap 注册所有需要的全局热键（start_generate 与 switch_emote_*）"""
+        try:
+            if not PLATFORM.startswith('win'):
+                return
+            km = self.textbox.keymap
+            # 先清理已有
+            try:
+                self._unregister_global_hotkey()
+            except Exception:
+                pass
+            # 注册开始生成键（若存在）
+            start_key = km.get('start_generate')
+            if start_key:
+                try:
+                    self._register_global_hotkey(start_key, callback=lambda: self.action_generate())
+                except Exception:
+                    pass
+            # 注册切换表情 1..5
+            for n in range(1, 6):
+                kname = f"switch_emote_{n}"
+                key = km.get(kname)
+                if key:
                     try:
-                        keyboard.clear_all_hotkeys()
+                        # callback: 切换到第 n 表情
+                        self._register_global_hotkey(key, callback=lambda n=n: self.action_switch_emote(n))
                     except Exception:
                         pass
-                self._hotkey_handle = None
-                self.hotkey_registered = False
-                self.update_status("已取消全局快捷键。")
+        except Exception:
+            pass
+
+    def action_switch_emote(self, n: int):
+        """通过快捷键切换到表情 n（1-based）"""
+        try:
+            n = int(n)
+        except Exception:
+            return
+        # 设置内部状态与 UI
+        try:
+            # 若当前角色的 emotion_count 小于 n，则忽略
+            cnt = 1
+            try:
+                cnt = self.textbox.get_current_emotion_count()
+            except Exception:
+                pass
+            if n < 1 or n > max(1, cnt):
+                self.update_status(f"表情 {n} 无效（当前角色表情数: {cnt}）", state='ready')
+                return
+            self.textbox.emote = n
+            # 更新 UI 下拉框（主线程）
+            try:
+                self._call_in_main_thread(self.emotion_var.set, n)
+            except Exception:
+                self.emotion_var.set(n)
+            self.update_status(f"已切换到表情 {n}")
         except Exception:
             pass
 

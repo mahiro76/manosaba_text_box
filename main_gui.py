@@ -95,8 +95,13 @@ class ManosabaTextBox:
         self.current_character_index = 3  # 当前角色索引，默认第三个角色（sherri）
 
     def setup_paths(self):
-        """设置文件路径"""
-        self.BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+        """设置文件路径，兼容 PyInstaller onefile（使用 sys._MEIPASS）"""
+        import sys
+        # 如果运行在 PyInstaller onefile 模式，资源会被解到 sys._MEIPASS
+        base = getattr(sys, "_MEIPASS", None)
+        if base is None:
+            base = os.path.dirname(os.path.abspath(__file__))
+        self.BASE_PATH = base
         self.CONFIG_PATH = os.path.join(self.BASE_PATH, "config")
         self.ASSETS_PATH = os.path.join(self.BASE_PATH, "assets")
         self.CACHE_PATH = os.path.join(self.ASSETS_PATH, "cache")

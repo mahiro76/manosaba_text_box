@@ -3,3 +3,8 @@ win32:
   pause: ctrl+r
   quit: ctrl+q
   start_generate: ctrl+e
+  switch_emote_1: ctrl+1
+  switch_emote_2: ctrl+2
+  switch_emote_3: ctrl+3
+  switch_emote_4: ctrl+4
+  switch_emote_5: ctrl+5

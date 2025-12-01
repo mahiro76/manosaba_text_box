@@ -606,7 +606,22 @@ class ManosabaGUI:
         except Exception as e:
             self.update_status(f"无法打开设置窗口: {e}")
             return
-        SettingsDialog(self)
+        # 在打开设置窗口前暂停所有全局热键，避免它们抢占按键事件
+        try:
+            self._unregister_global_hotkey()
+        except Exception:
+            pass
+        dlg = SettingsDialog(self)
+        # 等待设置窗口关闭后再恢复全局热键（SettingsDialog 会在关闭时调用 parent._setup_global_hotkey 作二次保险）
+        try:
+            self.root.wait_window(dlg)
+        except Exception:
+            pass
+        try:
+            # 恢复注册（如果设置中有新的映射会生效）
+            self._setup_global_hotkey()
+        except Exception:
+            pass
 
     def _register_global_hotkey(self, key: str, callback=None):
         """注册全局热键并返回 handle；callback 可选，默认触发生成"""
@@ -642,10 +657,17 @@ class ManosabaGUI:
             # 记录句柄
             self._hotkey_handles[key] = handle
             self.hotkey_registered = True
-            self.update_status(f"已注册全局快捷键: {key}")
+            # 注册完成，写日志但不在状态栏重复显示
+            try:
+                self._log(f"已注册全局快捷键: {key}", level='info')
+            except Exception:
+                pass
             return handle
         except Exception as e:
-            self.update_status(f"注册快捷键失败: {e}")
+            try:
+                self._log(f"注册快捷键失败: {e}", level='warning')
+            except Exception:
+                pass
             return None
 
     def _unregister_global_hotkey(self):
@@ -669,7 +691,10 @@ class ManosabaGUI:
                     pass
             self._hotkey_handles.clear()
             self.hotkey_registered = False
-            self.update_status("已取消全局快捷键。")
+            try:
+                self._log("已取消全局热键。", level='info')
+            except Exception:
+                pass
         except Exception:
             pass
 

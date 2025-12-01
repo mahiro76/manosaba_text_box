@@ -52,15 +52,30 @@ class SettingsDialog(tk.Toplevel):
                 ttk.Button(frm, text="测试", width=6, command=lambda key=f"switch_emote_{i}": self._on_test_key(key)).grid(row=i, column=3, padx=4)
                 self.emote_vars[i] = v
 
+            # 新增：暂停生成 与 退出程序 的快捷键绑定（紧跟表情项）
+            ttk.Label(frm, text="暂停生成:").grid(row=6, column=0, sticky='w')
+            self.pause_var = tk.StringVar(value=self.parent.textbox.keymap.get('pause', self.parent.textbox.keymap.get('pause_app', '')))
+            lbl_pause = ttk.Label(frm, textvariable=self.pause_var, width=28, relief='sunken', anchor='w')
+            lbl_pause.grid(row=6, column=1, padx=6, pady=2, sticky='w')
+            ttk.Button(frm, text="绑定", width=8, command=lambda: self._start_recording('pause')).grid(row=6, column=2, padx=4)
+            ttk.Button(frm, text="测试", width=6, command=lambda: self._on_test_key('pause')).grid(row=6, column=3, padx=4)
+
+            ttk.Label(frm, text="退出程序:").grid(row=7, column=0, sticky='w')
+            self.quit_var = tk.StringVar(value=self.parent.textbox.keymap.get('quit', self.parent.textbox.keymap.get('quit_app', '')))
+            lbl_quit = ttk.Label(frm, textvariable=self.quit_var, width=28, relief='sunken', anchor='w')
+            lbl_quit.grid(row=7, column=1, padx=6, pady=2, sticky='w')
+            ttk.Button(frm, text="绑定", width=8, command=lambda: self._start_recording('quit')).grid(row=7, column=2, padx=4)
+            ttk.Button(frm, text="测试", width=6, command=lambda: self._on_test_key('quit')).grid(row=7, column=3, padx=4)
+
             # 记录与线程控制
             self._binding_thread = None
             self._binding_stop = threading.Event()
 
             # 底部按钮（功能：清除缓存 / 查看日志 / 管理角色 / 取消）
             top_btns = ttk.Frame(frm)
-            top_btns.grid(row=7, column=0, columnspan=4, pady=(8, 4), sticky='w')
+            top_btns.grid(row=8, column=0, columnspan=4, pady=(8, 4), sticky='w')
             bottom_btns = ttk.Frame(frm)
-            bottom_btns.grid(row=8, column=0, columnspan=4, pady=(0, 8), sticky='e')
+            bottom_btns.grid(row=9, column=0, columnspan=4, pady=(0, 8), sticky='e')
 
             ttk.Button(top_btns, text="清除缓存", command=self._on_delete_cache, width=12).pack(side='left', padx=6)
             ttk.Button(top_btns, text="查看日志", command=self._on_view_logs, width=12).pack(side='left', padx=6)
@@ -224,7 +239,7 @@ class SettingsDialog(tk.Toplevel):
                     self.parent._setup_global_hotkey()
             except Exception:
                 pass
-            # 同步更新界面上的显示变量（如果目标是 start_generate 或 switch_emote_n）
+            # 同步更新界面上的显示变量（如果目标是 start_generate 或 switch_emote_n / pause / quit）
             try:
                 if keyname == "start_generate":
                     self.hotkey_var.set(combo)
@@ -232,25 +247,33 @@ class SettingsDialog(tk.Toplevel):
                     n = int(keyname.split("_")[-1])
                     if n in self.emote_vars:
                         self.emote_vars[n].set(combo)
-                    # 额外：立即让主界面切换到该表情（在主线程执行）
-                    try:
-                        # 使用父窗口提供的安全调用方式执行切换
-                        if hasattr(self.parent, "_call_in_main_thread"):
-                            self.parent._call_in_main_thread(self.parent.action_switch_emote, n)
-                        else:
-                            # 兜底直接调用
-                            self.parent.action_switch_emote(n)
-                    except Exception:
-                        # 兜底：直接设置变量与 textbox 状态
+                        # 绑定切换表情时，同时让主界面切换到该表情（在主线程执行）
                         try:
-                            self.parent.textbox.emote = n
-                            if hasattr(self.parent, "emotion_var"):
-                                try:
-                                    self.parent._call_in_main_thread(self.parent.emotion_var.set, n)
-                                except Exception:
-                                    self.parent.emotion_var.set(n)
+                            if hasattr(self.parent, "_call_in_main_thread"):
+                                self.parent._call_in_main_thread(self.parent.action_switch_emote, n)
+                            else:
+                                self.parent.action_switch_emote(n)
                         except Exception:
-                            pass
+                            # 兜底设置
+                            try:
+                                self.parent.textbox.emote = n
+                                if hasattr(self.parent, "emotion_var"):
+                                    try:
+                                        self.parent._call_in_main_thread(self.parent.emotion_var.set, n)
+                                    except Exception:
+                                        self.parent.emotion_var.set(n)
+                            except Exception:
+                                pass
+                elif keyname == 'pause':
+                    try:
+                        self.pause_var.set(combo)
+                    except Exception:
+                        pass
+                elif keyname == 'quit':
+                    try:
+                        self.quit_var.set(combo)
+                    except Exception:
+                        pass
             except Exception:
                 pass
         except Exception:

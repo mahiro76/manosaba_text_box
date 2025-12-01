@@ -531,7 +531,7 @@ class ManosabaGUI:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("魔裁 文本框生成器（GUI）")
+        self.root.title("对话框生成器-改自魔裁生成器-mahiro76")
         self.textbox = ManosabaTextBox()
         self.active = True
         self.hotkey_registered = False

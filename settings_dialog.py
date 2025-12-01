@@ -7,6 +7,7 @@ import shutil
 from sys import platform as _platform
 import threading
 import time
+import webbrowser
 
 PLATFORM = _platform.lower()
 
@@ -82,6 +83,8 @@ class SettingsDialog(tk.Toplevel):
             ttk.Button(top_btns, text="管理角色", command=self._on_manage_characters, width=12).pack(side='left', padx=6)
 
             ttk.Button(bottom_btns, text="取消", command=self._on_cancel, width=12).pack(side='right', padx=6)
+            # 新增：反馈问题 按钮（打开 GitHub issues 页面）
+            ttk.Button(bottom_btns, text="反馈问题", command=self._on_report_issue, width=12).pack(side='right', padx=6)
 
             self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
@@ -366,6 +369,17 @@ class SettingsDialog(tk.Toplevel):
             self.destroy()
         except Exception:
             pass
+
+    def _on_report_issue(self):
+        """在默认浏览器中打开项目 issue 页面用于反馈问题"""
+        url = "https://github.com/mahiro76/manosaba_text_box/issues"
+        try:
+            webbrowser.open(url, new=2)  # new=2 尝试在新标签页打开
+        except Exception as e:
+            try:
+                messagebox.showerror("打开失败", f"无法在浏览器中打开链接：{e}", parent=self)
+            except Exception:
+                pass
 
 
 # 简化的角色管理与导入对话（保留现有行为）

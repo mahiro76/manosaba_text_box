@@ -121,6 +121,19 @@ class ManosabaTextBox:
             config = yaml.safe_load(fp)
             self.process_whitelist = config.get(PLATFORM, [])
 
+        # 确保 current_character_index 在角色列表范围内（防止默认值超出）
+        try:
+            if not hasattr(self, "current_character_index") or self.current_character_index < 1:
+                self.current_character_index = 1
+            if self.character_list:
+                # clamp 到 [1, len(character_list)]
+                self.current_character_index = min(self.current_character_index, max(1, len(self.character_list)))
+            else:
+                # 若无角色，设为 1（后续 get_character 会处理空列表）
+                self.current_character_index = 1
+        except Exception:
+            self.current_character_index = 1
+
     def get_character(self, index: str | None = None, full_name: bool = False) -> str:
         """
         获取角色名称
@@ -130,11 +143,26 @@ class ManosabaTextBox:
         Returns:
             角色名称 (str)
         """
-        if index is not None:
-            return self.mahoshojo[index]['full_name'] if full_name else index
+        # 若传入具体索引名，直接返回（假设 caller 确认存在）
+        if index is not None and index != "":
+            try:
+                return self.mahoshojo[index]['full_name'] if full_name else index
+            except Exception:
+                # 如果给定的 index 不存在，兜底返回空字符串
+                return ""
         else:
-            chara = self.character_list[self.current_character_index - 1]
-            return self.mahoshojo[chara]['full_name'] if full_name else chara
+            # 当没有角色时返回空字符串，调用者需做空值判断
+            if not self.character_list:
+                return ""
+            # 确保 current_character_index 在合法范围内
+            try:
+                idx = max(0, min(self.current_character_index - 1, len(self.character_list) - 1))
+                # 同步回 current_character_index（防止未来越界）
+                self.current_character_index = idx + 1
+                chara = self.character_list[idx]
+                return self.mahoshojo[chara]['full_name'] if full_name else chara
+            except Exception:
+                return ""
 
     def switch_character(self, index: int) -> bool:
         """切换到指定索引的角色"""
@@ -159,7 +187,7 @@ class ManosabaTextBox:
                 os.remove(os.path.join(folder_path, filename))
 
     def generate_and_save_images(self, character_name: str, progress_callback=None) -> None:
-        """生成并保存指定角色的所有表情图片"""
+        """生成并保存指定角色的所有表情图片（优先使用角色目录下的背景文件）"""
         emotion_cnt = self.mahoshojo[character_name]["emotion_count"]
 
         # 检查是否已经生成过
@@ -169,27 +197,53 @@ class ManosabaTextBox:
 
         total_images = 16 * emotion_cnt
 
+        # 尝试获取角色专属背景文件列表（assets/chara/<character>/background/*）
+        char_bg_dir = os.path.join(self.BASE_PATH, 'assets', 'chara', character_name, 'background')
+        char_bg_files = []
+        if os.path.isdir(char_bg_dir):
+            for ext in ('*.png', '*.jpg', '*.jpeg', '*.bmp'):
+                char_bg_files.extend(sorted(glob.glob(os.path.join(char_bg_dir, ext))))
+            # 保持顺序且非空
+            char_bg_files = [p for p in char_bg_files if os.path.isfile(p)]
+
         for j in range(emotion_cnt):
             for i in range(16):
-                background_path = os.path.join(
-                    self.BASE_PATH, 'assets', "background", f"c{i + 1}.png"
-                )
+                # 优先使用角色目录内背景（按序或循环），否则回退到全局 background/cN.png
+                img_idx = j * 16 + i
+                if char_bg_files:
+                    bg_path = char_bg_files[img_idx % len(char_bg_files)]
+                else:
+                    global_bg_path = os.path.join(self.BASE_PATH, 'assets', "background", f"c{i + 1}.png")
+                    bg_path = global_bg_path if os.path.isfile(global_bg_path) else None
+
                 overlay_path = os.path.join(
                     self.BASE_PATH, 'assets', 'chara', character_name,
                     f"{character_name} ({j + 1}).png"
                 )
 
-                background = Image.open(background_path).convert("RGBA")
-                overlay = Image.open(overlay_path).convert("RGBA")
+                if bg_path is None or not os.path.isfile(overlay_path):
+                    # 若任一资源缺失，跳过此张（避免异常导致全部失败）
+                    continue
+
+                try:
+                    background = Image.open(bg_path).convert("RGBA")
+                    overlay = Image.open(overlay_path).convert("RGBA")
+                except Exception:
+                    continue
 
                 img_num = j * 16 + i + 1
                 result = background.copy()
+                # 固定粘贴位置（与原逻辑一致）
                 result.paste(overlay, (0, 134), overlay)
 
                 save_path = os.path.join(
                     self.CACHE_PATH, f"{character_name} ({img_num}).jpg"
                 )
-                result.convert("RGB").save(save_path)
+                try:
+                    result.convert("RGB").save(save_path)
+                except Exception:
+                    # 忽略单张保存失败，继续生成剩余图片
+                    pass
 
                 if progress_callback:
                     progress_callback(j * 16 + i + 1, total_images)
@@ -522,9 +576,21 @@ class ManosabaGUI:
         # 将主窗口居中（使以 root 为 parent 的弹窗也以屏幕居中）
         self.center_window(self.root)
 
-        # 预加载当前角色
-        char_name = self.textbox.get_character(self.char_var.get() or None)
-        self.load_character_images(char_name)
+        # 预加载当前角色（仅在存在角色时）
+        if self.textbox.character_list:
+            current_id = self.textbox.get_character(None)
+            if current_id:
+                try:
+                    self.load_character_images(current_id)
+                except Exception:
+                    # 如果加载失败也不要中断 GUI 启动
+                    self.update_status("预加载角色失败，稍后请在设置中检查资源。", state='ready')
+        else:
+            # 没有读取到任何角色，提示用户去设置中添加
+            try:
+                self.update_status("未发现任何角色配置，请在设置中添加角色。", state='ready')
+            except Exception:
+                pass
 
         # 尝试注册全局热键（可选）
         self._setup_global_hotkey()
@@ -606,6 +672,7 @@ class ManosabaGUI:
         top.pack(fill='x', pady=4)
 
         ttk.Label(top, text="角色:").grid(row=0, column=0, sticky='w')
+        # 改为显示“角色名称”（full_name）
         self.char_combo = ttk.Combobox(top, textvariable=self.char_var, state='readonly', width=40)
         self.char_combo.grid(row=0, column=1, padx=6, sticky='w')
 
@@ -655,17 +722,29 @@ class ManosabaGUI:
         self._apply_status_color('ready')
 
     def _populate_characters(self):
-        chars = self.textbox.character_list
-        # 显示 id（索引名）供选择，但也可显示带全名
-        self.char_combo['values'] = chars
-        if chars:
-            initial = self.textbox.get_character(None)
-            self.char_var.set(initial)
-            self._populate_emotions(initial)
+        # 使用 full_name 显示，但内部保留 id 映射
+        chars = self.textbox.character_list  # list of ids
+        display_names = []
+        self.display_to_id = {}
+        for cid in chars:
+            try:
+                full = str(self.textbox.mahoshojo.get(cid, {}).get('full_name', cid) or cid)
+            except Exception:
+                full = cid
+            display_names.append(full)
+            self.display_to_id[full] = cid
+        self.char_combo['values'] = display_names
+        if display_names:
+            # 设定初始为当前角色的 full_name
+            current_id = self.textbox.get_character(None)
+            current_display = self.textbox.mahoshojo.get(current_id, {}).get('full_name', current_id)
+            self.char_var.set(current_display)
+            # 填充表情，传入 id
+            self._populate_emotions(current_id)
 
     def _populate_emotions(self, char_id):
         try:
-            # 获取情绪数量，填充表情下拉
+            # char_id 是 id（索引名）
             self.textbox.switch_character(self.textbox.character_list.index(char_id) + 1)
             cnt = self.textbox.get_current_emotion_count()
             values = list(range(1, cnt + 1))
@@ -682,15 +761,25 @@ class ManosabaGUI:
         self.root.protocol("WM_DELETE_WINDOW", self.action_quit)
 
     def _on_character_changed(self, event=None):
-        selected = self.char_var.get()
-        if selected:
-            idx = self.textbox.character_list.index(selected) + 1
-            self.textbox.switch_character(idx)
-            # 后台加载
-            self.load_character_images(selected)
-            # 重置表情面板
-            self._populate_emotions(selected)
-            self.update_status(f"已选择角色: {selected}")
+        selected_display = self.char_var.get()
+        if not selected_display:
+            return
+        # 把显示名映射回 id
+        cid = self.display_to_id.get(selected_display)
+        if not cid:
+            # 兜底（若用户编辑或配置异常），尝试按 id 匹配
+            if selected_display in self.textbox.character_list:
+                cid = selected_display
+        if not cid:
+            self.update_status("选择的角色无效", state='ready')
+            return
+        idx = self.textbox.character_list.index(cid) + 1
+        self.textbox.switch_character(idx)
+        # 后台加载（传入 id）
+        self.load_character_images(cid)
+        # 重置表情面板
+        self._populate_emotions(cid)
+        self.update_status(f"已选择角色: {selected_display}")
 
     def _on_emotion_changed(self, event=None):
         try:
@@ -730,7 +819,9 @@ class ManosabaGUI:
         self.root.after(0, lambda: func(*args, **kwargs))
 
     def load_character_images(self, char_name: str):
-        """后台加载角色图片并更新进度"""
+        """后台加载角色图片并更新进度
+           char_name 这里是角色 id（索引名）
+        """
         def update_progress(current, total):
             pct = int(current / total * 100) if total else 0
             self._call_in_main_thread(self._set_progress, pct)
@@ -740,6 +831,7 @@ class ManosabaGUI:
             self._call_in_main_thread(self._set_ui_state, False)
             self._call_in_main_thread(self.update_status, f"正在加载角色 {self.textbox.get_character(char_name, full_name=True)} ...", 'running')
             try:
+                # 修改：generate_and_save_images 将优先使用角色目录下的背景
                 self.textbox.generate_and_save_images(char_name, update_progress)
                 # 加载完成后明确恢复为就绪（绿色）
                 self._call_in_main_thread(self.update_status, f"角色 {self.textbox.get_character(char_name, full_name=True)} 加载完成 ✓", 'ready')
@@ -925,9 +1017,10 @@ class ManosabaGUI:
     def action_pause(self):
         self.active = not self.active
         if not self.active:
-            # 切换到暂停：记录当前选中角色，设置状态为 paused
+            # 切换到暂停：记录当前选中角色 id（通过映射）
             try:
-                self.paused_char = self.char_var.get() or None
+                sel = self.char_var.get()
+                self.paused_char = self.display_to_id.get(sel) if hasattr(self, 'display_to_id') else (sel or None)
             except Exception:
                 self.paused_char = None
             self.update_status("应用已暂停。", 'paused')
@@ -938,7 +1031,6 @@ class ManosabaGUI:
             self.update_status("应用已恢复，正在恢复角色...", 'running')
             if self.paused_char:
                 try:
-                    # 异步加载已暂停的角色（load_character_images 会在后台线程执行）
                     self.load_character_images(self.paused_char)
                 except Exception:
                     pass
@@ -1079,4 +1171,3 @@ if __name__ == "__main__":
             sys.exit(0)
         except Exception:
             pass
-

@@ -377,7 +377,8 @@ class _SimpleEditDialog(tk.Toplevel):
         self.var_id = tk.StringVar(value=role_id or "")
         ttk.Entry(frm, textvariable=self.var_id, width=30).grid(row=0, column=1, padx=6, pady=4)
 
-        ttk.Label(frm, text="显示名称 (full_name):").grid(row=1, column=0, sticky='w')
+        # 将标签名改为“角色名称”
+        ttk.Label(frm, text="角色名称 (full_name):").grid(row=1, column=0, sticky='w')
         self.var_full = tk.StringVar()
         ttk.Entry(frm, textvariable=self.var_full, width=30).grid(row=1, column=1, padx=6, pady=4)
 
@@ -412,9 +413,25 @@ class _SimpleEditDialog(tk.Toplevel):
             em_cnt = int(self.var_emotion.get() or 0)
         except Exception:
             em_cnt = 1
-        if not cid or not full or em_cnt <= 0:
-            messagebox.showwarning("输入错误", "请确保 ID、显示名称 和 表情数量 有效。", parent=self)
+        if not cid or em_cnt <= 0:
+            messagebox.showwarning("输入错误", "请确保 ID 与 表情数量 有效。", parent=self)
             return
+
+        # 若用户未填写显示名称，则使用 ID 作为显示名（避免“名字对话框内没有角色名字”）
+        if not full:
+            full = cid
+
+        # 如果 font 是绝对路径或包含程序 assets 路径，保存时仅写文件名
+        try:
+            if font:
+                if os.path.isabs(font):
+                    font = os.path.basename(font)
+                else:
+                    # 若用户复制的是程序内绝对路径，也尝试提取 basename
+                    if os.path.sep in font:
+                        font = os.path.basename(font)
+        except Exception:
+            pass
 
         cfg_file = os.path.join(self.maingui.textbox.CONFIG_PATH, "chara_meta.yml")
         try:
@@ -431,7 +448,7 @@ class _SimpleEditDialog(tk.Toplevel):
 
         cfg["mahoshojo"][cid] = {
             "full_name": full,
-            "font": font or self.maingui.textbox.get_current_font(),
+            "font": font or os.path.basename(self.maingui.textbox.get_current_font()),
             "emotion_count": em_cnt
         }
 

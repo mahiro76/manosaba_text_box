@@ -5,7 +5,7 @@ import os
 import yaml
 from sys import platform as _platform
 import shutil
-from tkinter import filedialog
+from tkinter import filedialog, colorchooser
 
 PLATFORM = _platform.lower()
 
@@ -72,6 +72,7 @@ class SettingsDialog(tk.Toplevel):
         self.btn_cancel.pack(side='left', padx=6)
 
         self._test_handle = None
+        self._reload_after_close = False  # 新：标记是否在关闭后需要重载角色
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
     def _on_test(self):
@@ -155,17 +156,50 @@ class SettingsDialog(tk.Toplevel):
             except Exception:
                 pass
             self._test_handle = None
+
+        # 如果之前执行了清除缓存，则在关闭设置窗口前触发主窗口重新加载上次选定的角色
+        try:
+            if getattr(self, "_reload_after_close", False):
+                try:
+                    # 优先通过 display -> id 映射获取角色 id
+                    last_id = None
+                    if hasattr(self.parent, "display_to_id"):
+                        sel_display = getattr(self.parent, "char_var", None)
+                        if sel_display:
+                            # sel_display 可能是 StringVar
+                            sel_val = sel_display.get() if hasattr(sel_display, "get") else sel_display
+                            last_id = self.parent.display_to_id.get(sel_val)
+                    # 兜底使用 textbox 提供的当前角色方法
+                    if not last_id:
+                        last_id = self.parent.textbox.get_character(None)
+                    if last_id:
+                        # 在主线程调用（load_character_images 本身会在后台线程执行加载）
+                        try:
+                            self.parent.load_character_images(last_id)
+                        except Exception:
+                            # 若直接调用失败，尝试放到主线程队列执行
+                            try:
+                                self.parent._call_in_main_thread(self.parent.load_character_images, last_id)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         self.destroy()
 
     def _on_delete_cache(self):
         try:
             self.parent.textbox.delete(self.parent.textbox.CACHE_PATH)
+            # 标记：退出设置后需要重载上次选定角色
+            self._reload_after_close = True
             # 通知主窗口状态（置为就绪）
             try:
                 self.parent.update_status("缓存已清除，需要重新加载角色", state='ready')
             except Exception:
                 pass
-            messagebox.showinfo("清除完成", "缓存已清除。", parent=self)
+            messagebox.showinfo("清除完成", "缓存已清除。关闭设置后将自动重载上次选定的角色。", parent=self)
         except Exception as e:
             messagebox.showerror("清除失败", f"清除缓存失败: {e}", parent=self)
 
@@ -220,11 +254,9 @@ class CharacterListDialog(tk.Toplevel):
 
         ttk.Button(btn_frame, text="关闭", command=self.destroy, width=12).grid(row=2, column=0, columnspan=2, pady=(10,0))
 
-        # 居中
+        # 居中（使用主窗口提供的 center_window，避免直接使用未稳定的 winfo_width/height）
         try:
-            self.update_idletasks()
-            self.master = parent
-            self.geometry(f"+{(self.winfo_screenwidth()-self.winfo_width())//2}+{(self.winfo_screenheight()-self.winfo_height())//2}")
+            self.maingui.center_window(self)
         except Exception:
             pass
 
@@ -283,6 +315,25 @@ class CharacterListDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("删除失败", f"写入配置失败: {e}", parent=self)
             return
+
+        # 额外：从 text_configs.yml 中删除对应的名字配置（如果存在）
+        try:
+            txt_cfg_path = os.path.join(self.maingui.textbox.CONFIG_PATH, "text_configs.yml")
+            try:
+                with open(txt_cfg_path, 'r', encoding='utf-8') as ftxt:
+                    tcfg = yaml.safe_load(ftxt) or {}
+            except Exception:
+                tcfg = {}
+            if "text_configs" in tcfg and role in tcfg["text_configs"]:
+                try:
+                    del tcfg["text_configs"][role]
+                    with open(txt_cfg_path, 'w', encoding='utf-8') as ftxt:
+                        yaml.safe_dump(tcfg, ftxt, allow_unicode=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # 重新加载并刷新
         try:
             self.maingui.textbox.load_configs()
@@ -326,8 +377,9 @@ class CharacterListDialog(tk.Toplevel):
         files = filedialog.askopenfilenames(title="选择要导入的背景图（多选）", filetypes=[("PNG", "*.png"),("JPG","*.jpg;*.jpeg"),("All","*.*")], parent=self)
         if not files:
             return
-        dest_dir = os.path.join(self.maingui.textbox.ASSETS_PATH, 'background')
+        # 导入到角色专属背景目录：assets/chara/<role>/background
         try:
+            dest_dir = os.path.join(self.maingui.textbox.ASSETS_PATH, 'chara', role_id, 'background')
             os.makedirs(dest_dir, exist_ok=True)
             copied = 0
             for f in files:
@@ -372,26 +424,79 @@ class _SimpleEditDialog(tk.Toplevel):
 
         frm = ttk.Frame(self, padding=10)
         frm.pack(fill='both', expand=True)
+        # 让第二列可扩展，避免控件被截断
+        try:
+            frm.columnconfigure(1, weight=1)
+        except Exception:
+            pass
 
         ttk.Label(frm, text="角色 ID (索引):").grid(row=0, column=0, sticky='w')
         self.var_id = tk.StringVar(value=role_id or "")
-        ttk.Entry(frm, textvariable=self.var_id, width=30).grid(row=0, column=1, padx=6, pady=4)
+        ttk.Entry(frm, textvariable=self.var_id, width=30).grid(row=0, column=1, padx=6, pady=4, sticky='we')
 
         # 将标签名改为“角色名称”
         ttk.Label(frm, text="角色名称 (full_name):").grid(row=1, column=0, sticky='w')
         self.var_full = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.var_full, width=30).grid(row=1, column=1, padx=6, pady=4)
+        ttk.Entry(frm, textvariable=self.var_full, width=30).grid(row=1, column=1, padx=6, pady=4, sticky='we')
 
         ttk.Label(frm, text="字体文件名 (font):").grid(row=2, column=0, sticky='w')
         self.var_font = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.var_font, width=30).grid(row=2, column=1, padx=6, pady=4)
+        ttk.Entry(frm, textvariable=self.var_font, width=30).grid(row=2, column=1, padx=6, pady=4, sticky='we')
 
         ttk.Label(frm, text="表情数量 (emotion_count):").grid(row=3, column=0, sticky='w')
         self.var_emotion = tk.IntVar(value=1)
         ttk.Entry(frm, textvariable=self.var_emotion, width=10).grid(row=3, column=1, padx=6, pady=4, sticky='w')
 
+        # 新增：字体颜色（R, G, B）允许用户自定义
+        ttk.Label(frm, text="字体颜色 (R,G,B):").grid(row=4, column=0, sticky='w')
+        # 将颜色输入与二级菜单包装在同一行
+        color_wrap = ttk.Frame(frm)
+        color_wrap.grid(row=4, column=1, padx=6, pady=4, sticky='w')
+
+        color_frame = ttk.Frame(color_wrap)
+        color_frame.pack(side='left')
+        self.var_color_r = tk.IntVar(value=255)
+        self.var_color_g = tk.IntVar(value=255)
+        self.var_color_b = tk.IntVar(value=255)
+        # 使用 Spinbox 让用户输入 0-255
+        tk.Spinbox(color_frame, from_=0, to=255, width=4, textvariable=self.var_color_r).pack(side='left')
+        tk.Label(color_frame, text=",").pack(side='left')
+        tk.Spinbox(color_frame, from_=0, to=255, width=4, textvariable=self.var_color_g).pack(side='left')
+        tk.Label(color_frame, text=",").pack(side='left')
+        tk.Spinbox(color_frame, from_=0, to=255, width=4, textvariable=self.var_color_b).pack(side='left')
+
+        # 二级菜单：颜色轮盘 + 预设色
+        def set_color(r, g, b):
+            try:
+                self.var_color_r.set(int(max(0, min(255, r))))
+                self.var_color_g.set(int(max(0, min(255, g))))
+                self.var_color_b.set(int(max(0, min(255, b))))
+            except Exception:
+                pass
+
+        def choose_color():
+            try:
+                res = colorchooser.askcolor(parent=self, title="选择颜色")
+                if res and res[0]:
+                    r, g, b = res[0]
+                    set_color(r, g, b)
+            except Exception:
+                pass
+
+        mb = tk.Menubutton(color_wrap, text="更多颜色 ▾", relief='raised')
+        menu = tk.Menu(mb, tearoff=0)
+        mb.config(menu=menu)
+        menu.add_command(label="颜色轮盘...", command=choose_color)
+        menu.add_separator()
+        menu.add_command(label="预设：白", command=lambda: set_color(255, 255, 255))
+        menu.add_command(label="预设：黑", command=lambda: set_color(0, 0, 0))
+        menu.add_command(label="预设：红", command=lambda: set_color(235, 75, 60))
+        menu.add_command(label="预设：绿", command=lambda: set_color(46, 204, 113))
+        menu.add_command(label="预设：蓝", command=lambda: set_color(52, 152, 219))
+        mb.pack(side='left', padx=(8,0))
+
         btn_frame = ttk.Frame(frm)
-        btn_frame.grid(row=4, column=0, columnspan=2, pady=(8,0), sticky='e')
+        btn_frame.grid(row=5, column=0, columnspan=2, pady=(8,0), sticky='e')
         ttk.Button(btn_frame, text="保存", command=self._on_save, width=10).pack(side='left', padx=6)
         ttk.Button(btn_frame, text="取消", command=self._on_cancel, width=10).pack(side='left', padx=6)
 
@@ -402,6 +507,30 @@ class _SimpleEditDialog(tk.Toplevel):
                 self.var_full.set(cfg.get("full_name", ""))
                 self.var_font.set(cfg.get("font", ""))
                 self.var_emotion.set(cfg.get("emotion_count", 1))
+                # 尝试从 text_configs.yml 读取颜色预设
+                try:
+                    txt_cfg_path = os.path.join(self.maingui.textbox.CONFIG_PATH, "text_configs.yml")
+                    with open(txt_cfg_path, 'r', encoding='utf-8') as ftxt:
+                        tcfg = yaml.safe_load(ftxt) or {}
+                        tc = tcfg.get("text_configs", {}).get(role_id)
+                        if tc and isinstance(tc, list) and len(tc) > 0:
+                            col = tc[0].get("font_color", [255,255,255])
+                            if len(col) >= 3:
+                                self.var_color_r.set(int(col[0]))
+                                self.var_color_g.set(int(col[1]))
+                                self.var_color_b.set(int(col[2]))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # 布局完成后再居中（使用主窗口提供的 center 方法，避免在控件尚未布局时计算错误）
+        try:
+            self.maingui.center_window(self)
+        except Exception:
+            try:
+                self.update_idletasks()
+                self.geometry(f"+{(self.winfo_screenwidth()-self.winfo_width())//2}+{(self.winfo_screenheight()-self.winfo_height())//2}")
             except Exception:
                 pass
 
@@ -413,6 +542,13 @@ class _SimpleEditDialog(tk.Toplevel):
             em_cnt = int(self.var_emotion.get() or 0)
         except Exception:
             em_cnt = 1
+        # 读取颜色
+        try:
+            cr = int(self.var_color_r.get()); cg = int(self.var_color_g.get()); cb = int(self.var_color_b.get())
+            cr = max(0, min(255, cr)); cg = max(0, min(255, cg)); cb = max(0, min(255, cb))
+        except Exception:
+            cr, cg, cb = 255, 255, 255
+
         if not cid or em_cnt <= 0:
             messagebox.showwarning("输入错误", "请确保 ID 与 表情数量 有效。", parent=self)
             return
@@ -463,6 +599,49 @@ class _SimpleEditDialog(tk.Toplevel):
             char_dir = os.path.join(self.maingui.textbox.ASSETS_PATH, 'chara', cid)
             os.makedirs(char_dir, exist_ok=True)
         except Exception:
+            pass
+
+        # 额外：在 text_configs.yml 中为该角色创建名字配置模板（4 段），并保存用户选择的字体颜色
+        try:
+            txt_cfg_path = os.path.join(self.maingui.textbox.CONFIG_PATH, "text_configs.yml")
+            try:
+                with open(txt_cfg_path, 'r', encoding='utf-8') as ftxt:
+                    tcfg = yaml.safe_load(ftxt) or {}
+            except FileNotFoundError:
+                tcfg = {}
+            except Exception:
+                tcfg = {}
+
+            if "text_configs" not in tcfg or not isinstance(tcfg["text_configs"], dict):
+                tcfg["text_configs"] = {}
+
+            # 将 full 拆成至多 4 段（优先单字分段）
+            segments = []
+            s = full or ""
+            for i in range(4):
+                ch = s[i] if i < len(s) else ""
+                segments.append(ch)
+
+            # 默认位置与字号模板（可根据需要调整）
+            default_positions = [[759,73], [943,110], [1093,175], [1183,175]]
+            default_sizes = [186, 147, 92, 92]
+
+            entries = []
+            for idx in range(4):
+                entries.append({
+                    "text": segments[idx],
+                    "position": default_positions[idx],
+                    "font_color": [cr, cg, cb],
+                    "font_size": default_sizes[idx]
+                })
+
+            tcfg["text_configs"][cid] = entries
+
+            # 写回文件
+            with open(txt_cfg_path, 'w', encoding='utf-8') as ftxt:
+                yaml.safe_dump(tcfg, ftxt, allow_unicode=True)
+        except Exception:
+            # 非阻塞错误：不阻止保存成功
             pass
 
         try:
